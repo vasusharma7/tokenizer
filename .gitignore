@@ -1,0 +1,11 @@
+# C binaries
+naive_bpe
+opt_bpe
+*.dSYM/
+
+# Dataset
+benchmark/data/
+
+# Python cache
+__pycache__/
+*.pyc
