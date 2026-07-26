@@ -162,13 +162,21 @@ static void list_free(void) {
 }
 
 /* ==================================================================
- *  Pair counting for training (uses flat 2D array — same as naive)
+ *  Pair counting for training — optimized with a touched-list
  *
- *  Still O(N) to count + O(vocab²) to find max.  The speedup during
- *  training comes from O(1) merges (no memmove) instead.
+ *  Instead of resetting and scanning the entire O(vocab²) matrix
+ *  every iteration, we track which pairs were actually modified
+ *  and only scan those.  This gives us:
+ *    - Reset:  O(touched)  instead of O(vocab²)
+ *    - Max:    O(touched)  instead of O(vocab²)
+ *  where touched ≈ number of unique pairs currently in the sequence
+ *  (typically ~thousands) vs vocab² (potentially millions).
  * ================================================================== */
 
 static int *pair_counts = NULL;
+static int *touched     = NULL;   /* stack of (left * cap + right) indices */
+static int  touched_count = 0;
+static int  touched_cap = 0;
 static int  pair_counts_cap = 0;
 
 static void pair_counts_init(int max_id) {
@@ -176,58 +184,84 @@ static void pair_counts_init(int max_id) {
     pair_counts = calloc(n, sizeof(int));
     if (!pair_counts) { perror("calloc"); exit(1); }
     pair_counts_cap = max_id;
-}
-
-static void pair_counts_reset(void) {
-    size_t n = (size_t)pair_counts_cap * pair_counts_cap;
-    memset(pair_counts, 0, n * sizeof(int));
+    touched       = NULL;
+    touched_count = 0;
+    touched_cap   = 0;
 }
 
 static void pair_counts_free(void) {
     free(pair_counts);
+    free(touched);
     pair_counts = NULL;
+    touched     = NULL;
     pair_counts_cap = 0;
+    touched_cap = 0;
 }
 
-/* Count pairs and find the most frequent one.
- * Walks the linked list (not an array) — O(N) count + O(vocab²) max scan. */
-static int find_most_frequent_pair(int32_t *out_pos, uint32_t *out_left, uint32_t *out_right) {
-    pair_counts_reset();
+/* Mark an index as touched (add to the touched stack if not already there). */
+static void pair_touch(int idx) {
+    if (pair_counts[idx] != 0) return;  /* already touched in this iteration */
+    if (touched_count >= touched_cap) {
+        touched_cap = touched_cap ? touched_cap * 2 : 1024;
+        touched = realloc(touched, touched_cap * sizeof(int));
+        if (!touched) { perror("realloc"); exit(1); }
+    }
+    touched[touched_count++] = idx;
+}
+
+/* Count pairs by walking the linked list.
+ * Clears old touched entries first, then builds a fresh touched list. */
+static void pair_counts_build(void) {
     int cap = pair_counts_cap;
 
-    /* Walk the linked list counting pairs — O(N) */
+    /* Clear previous counts (only touched entries, not the full matrix) */
+    for (int i = 0; i < touched_count; i++)
+        pair_counts[touched[i]] = 0;
+    touched_count = 0;
+
+    /* Walk the list and count each adjacent pair */
     for (int32_t i = head_idx; i >= 0; i = nodes[i].next) {
         int32_t j = nodes[i].next;
         if (j < 0) break;
         uint32_t l = nodes[i].token_id;
         uint32_t r = nodes[j].token_id;
-        if (l < (uint32_t)cap && r < (uint32_t)cap)
-            pair_counts[l * cap + r]++;
+        if (l < (uint32_t)cap && r < (uint32_t)cap) {
+            int idx = (int)(l * cap + r);
+            if (pair_counts[idx] == 0) pair_touch(idx);
+            pair_counts[idx]++;
+        }
     }
+}
 
-    /* Find highest count — O(vocab²) */
+/* Find the most frequent pair by scanning the touched list only.
+ * Returns 1 on success, 0 if no pairs exist. */
+static int find_most_frequent_pair(int32_t *out_pos,
+                                   uint32_t *out_left,
+                                   uint32_t *out_right) {
     int best_l = -1, best_r = -1, best_count = 0;
-    for (int l = 0; l < cap; l++) {
-        for (int r = 0; r < cap; r++) {
-            int c = pair_counts[l * cap + r];
-            if (c > best_count) {
-                best_count = c;
-                best_l = l;
-                best_r = r;
-            }
+    int cap = pair_counts_cap;
+
+    for (int i = 0; i < touched_count; i++) {
+        int idx = touched[i];
+        int c = pair_counts[idx];
+        if (c > best_count) {
+            best_count = c;
+            best_l = idx / cap;
+            best_r = idx % cap;
         }
     }
 
-    if (best_l < 0) return 0;  /* no pairs */
+    if (best_l < 0) return 0;
 
     *out_left  = (uint32_t)best_l;
     *out_right = (uint32_t)best_r;
 
-    /* Find first occurrence */
+    /* Find first occurrence in the linked list */
     for (int32_t i = head_idx; i >= 0; i = nodes[i].next) {
         int32_t j = nodes[i].next;
         if (j < 0) break;
-        if (nodes[i].token_id == (uint32_t)best_l && nodes[j].token_id == (uint32_t)best_r) {
+        if (nodes[i].token_id == (uint32_t)best_l &&
+            nodes[j].token_id == (uint32_t)best_r) {
             *out_pos = i;
             return 1;
         }
@@ -236,7 +270,9 @@ static int find_most_frequent_pair(int32_t *out_pos, uint32_t *out_left, uint32_
 }
 
 /* ==================================================================
- *  TRAINING (uses arena list for O(1) merges)
+ *  TRAINING (uses arena list + touched-list pair counting)
+ *
+ *  No O(vocab²) operations — reset and max-scan are both O(touched).
  * ================================================================== */
 
 static void train_bpe(const unsigned char *text, size_t len, int num_merges) {
@@ -247,6 +283,9 @@ static void train_bpe(const unsigned char *text, size_t len, int num_merges) {
 
     printf("  Initial tokens:  %d\n", list_len);
     fflush(stdout);
+
+    /* Initial pair count — O(N) list walk */
+    pair_counts_build();
 
     for (int m = 0; m < num_merges; m++) {
         if (list_len < 2) break;
@@ -259,9 +298,8 @@ static void train_bpe(const unsigned char *text, size_t len, int num_merges) {
         add_merge((int)left, (int)right, m);
         uint32_t new_id = (uint32_t)(next_new_id - 1);
 
-        /* Merge ALL occurrences of (left, right) */
-        /* Walk the list, merge on match, then continue from same position
-         * (since the list shrinks but the current node is still valid) */
+        /* Merge ALL occurrences of (left, right) in O(1) each via list_merge_at.
+         * After merge, continue from same node without re-scanning. */
         while (1) {
             int found = 0;
             for (int32_t i = head_idx; i >= 0; ) {
@@ -270,15 +308,16 @@ static void train_bpe(const unsigned char *text, size_t len, int num_merges) {
                 if (nodes[i].token_id == left && nodes[j].token_id == right) {
                     list_merge_at(i, new_id);
                     found = 1;
-                    /* Don't advance i — after merge, i now has new_id
-                     * and i.next is the node after the old j. Continue
-                     * scanning from here. */
-                    continue;
+                    continue;  /* same i — now has new_id */
                 }
                 i = nodes[i].next;
             }
             if (!found) break;
         }
+
+        /* Re-count — O(N) walk, but reset is O(touched) not O(vocab²).
+         * Max-scan is also O(touched). */
+        pair_counts_build();
 
         if ((m + 1) % 1000 == 0 || m == 0 || m == num_merges - 1) {
             printf("  Merge %5d/%d: pair (%u,%u) → id=%u, seq_len=%d\r",
