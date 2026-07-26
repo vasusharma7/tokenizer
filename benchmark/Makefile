@@ -31,7 +31,7 @@ bench_opt: opt_bpe data/wikitext_test.txt
 	@echo "  (500 merges, 50KB sample — 5000 on full file would be slow)"
 	@echo "============================================"
 	head -c 50000 data/wikitext_test.txt > /tmp/opt_sample.txt
-	./opt_bpe /tmp/opt_sample.txt 500 1
+	./opt_bpe /tmp/opt_sample.txt 50000 1
 
 opt_bpe: opt_bpe.c
 	$(CC) $(CFLAGS_OPT) -o $@ $< $(LDLIBS)
